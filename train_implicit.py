@@ -286,9 +286,9 @@ class ImplicitCurveDataset(Dataset):
             V.IntensityShift(shift_limit=0.1, p=0.8),
             # Геометрические (меняют и изображение, и маску, и точки)
             V.AxialPlaneAffine(
-                angle_limit=30,
-                scale_limit=0.08,
-                shift_limit=0.08,
+                angle_limit=45,
+                scale_limit=0.1,
+                shift_limit=0.1,
                 p=0.8,
                 fill_value=-1000,
             ),
@@ -614,9 +614,16 @@ def train_one_epoch(
                     f"gt range=[{gt_sample.min():.3f}, {gt_sample.max():.3f}]  "
                     f"mse={((pred_sample - gt_sample) ** 2).mean():.4f}"
                 )
-            mlp_out_grad = model.curve_mlp.out.weight.grad
-            if mlp_out_grad is not None:
-                print(f"  [GRAD] mlp_out={mlp_out_grad.norm():.4f}")
+            coarse_out_grad = model.coarse_mlp.out.weight.grad
+            refine_out_grad = model.refine_mlp.out.weight.grad
+            if coarse_out_grad is not None or refine_out_grad is not None:
+                coarse_norm = coarse_out_grad.norm().item() if coarse_out_grad is not None else 0.0
+                refine_norm = refine_out_grad.norm().item() if refine_out_grad is not None else 0.0
+                print(
+                    f"  [GRAD] coarse_out={coarse_norm:.4f} | refine_out={refine_norm:.4f} | "
+                    f"coarse_delta={model.last_coarse_delta_mean:.4f}/{model.last_coarse_delta_max:.4f} | "
+                    f"refine_delta={model.last_delta_mean:.4f}/{model.last_delta_max:.4f}"
+                )
 
         if (step_idx + 1) % accum_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -626,6 +633,10 @@ def train_one_epoch(
 
         for k, v in losses.items():
             running[k] += v.item()
+        running["coarse_delta_mean"] += float(getattr(model, "last_coarse_delta_mean", 0.0))
+        running["coarse_delta_max"] += float(getattr(model, "last_coarse_delta_max", 0.0))
+        running["delta_mean"] += float(getattr(model, "last_delta_mean", 0.0))
+        running["delta_max"] += float(getattr(model, "last_delta_max", 0.0))
         n_steps += 1
 
     print(f"  [timing] data={_t_data:.2f}s  enc={_t_enc:.2f}s  loss={_t_loss:.2f}s  back={_t_back:.2f}s  steps={n_steps}")
@@ -756,7 +767,9 @@ def fit(model: ImplicitCurveNet, data: dict):
             f"len={train_losses['length_left']:.4f}/{train_losses['length_right']:.4f} | "
             f"smooth={train_losses['smooth_left']:.4f}/{train_losses['smooth_right']:.4f} | "
             f"inside={train_losses.get('inside_left', 0.0):.4f}/{train_losses.get('inside_right', 0.0):.4f} | "
-            f"sdf={train_losses['sdf']:.4f}"
+            f"sdf={train_losses['sdf']:.4f} | "
+            f"coarse_delta={train_losses.get('coarse_delta_mean', 0.0):.4f}/{train_losses.get('coarse_delta_max', 0.0):.4f} | "
+            f"refine_delta={train_losses.get('delta_mean', 0.0):.4f}/{train_losses.get('delta_max', 0.0):.4f}"
         )
         print(
             f"  TRAIN MSD={train_metrics.get('msd_mean', 0):.4f} | "
@@ -784,28 +797,31 @@ def fit(model: ImplicitCurveNet, data: dict):
         )
 
         # ---- Визуализация ----
-        visualize_epoch(
-            model=averaged_model.module,
-            dataset=data["train"],
-            device=device,
-            epoch=epoch + 1,
-            vis_dir=vis_dir,
-            n_samples=config.get("VIS_SAMPLES", 2),
-            n_points=256,
-            split_name="train",
-            make_html=False,
-        )
-        visualize_epoch(
-            model=averaged_model.module,
-            dataset=data["val"],
-            device=device,
-            epoch=epoch + 1,
-            vis_dir=vis_dir,
-            n_samples=config.get("VIS_SAMPLES", 2),
-            n_points=256,
-            split_name="val",
-            make_html=True,
-        )
+        vis_every = int(config.get("VIS_EVERY", 1))
+        should_visualize = vis_every > 0 and ((epoch + 1) % vis_every == 0 or epoch == 0)
+        if should_visualize:
+            visualize_epoch(
+                model=averaged_model.module,
+                dataset=data["train"],
+                device=device,
+                epoch=epoch + 1,
+                vis_dir=vis_dir,
+                n_samples=config.get("VIS_SAMPLES", 2),
+                n_points=256,
+                split_name="train",
+                make_html=False,
+            )
+            visualize_epoch(
+                model=averaged_model.module,
+                dataset=data["val"],
+                device=device,
+                epoch=epoch + 1,
+                vis_dir=vis_dir,
+                n_samples=config.get("VIS_SAMPLES", 2),
+                n_points=256,
+                split_name="val",
+                make_html=True,
+            )
 
         # ---- Сохранение истории эпох ----
         row = {"epoch": epoch + 1, "lr": float(current_lr)}
@@ -838,18 +854,19 @@ def fit(model: ImplicitCurveNet, data: dict):
             for k, v in val_metrics.items():
                 logger.report_scalar("val_metrics", k, iteration=epoch, value=v)
             logger.report_scalar("val_metrics", "score (MSD mean)", iteration=epoch, value=score)
-            # Загружаем PNG в ClearML
-            for split_name in ("train", "val"):
-                ds = data[split_name]
-                for key in ds.keys[:config.get("VIS_SAMPLES", 2)]:
-                    png_path = vis_dir / split_name / "png" / f"epoch_{epoch + 1:03d}_{key}.png"
-                    if png_path.exists() and config.get("TASK") is not None:
-                        config["TASK"].get_logger().report_image(
-                            title=f"{split_name} curves",
-                            series=key,
-                            iteration=epoch,
-                            local_path=str(png_path),
-                        )
+            # Загружаем PNG в ClearML только в эпохи визуализации
+            if should_visualize:
+                for split_name in ("train", "val"):
+                    ds = data[split_name]
+                    for key in ds.keys[:config.get("VIS_SAMPLES", 2)]:
+                        png_path = vis_dir / split_name / "png" / f"epoch_{epoch + 1:03d}_{key}.png"
+                        if png_path.exists() and config.get("TASK") is not None:
+                            config["TASK"].get_logger().report_image(
+                                title=f"{split_name} curves",
+                                series=key,
+                                iteration=epoch,
+                                local_path=str(png_path),
+                            )
 
         # ---- Checkpoint ----
         if score < best_score:
@@ -915,6 +932,7 @@ def main():
     vis = cfg.get("visualization", {})
     config["VIS_DIR"] = vis.get("vis_dir", "vis")
     config["VIS_SAMPLES"] = vis.get("vis_samples", 2)
+    config["VIS_EVERY"] = int(vis.get("vis_every", 1))
 
     config["TASK"] = None
 
@@ -964,6 +982,12 @@ def main():
         branch_emb_dim=mc.get("branch_emb_dim", 8),
         local_feat_channels=mc.get("local_feat_channels", 32),
         num_refine_passes=mc.get("num_refine_passes", 1),
+        refine_scale=mc.get("refine_scale", 0.25),
+        coarse_scale=mc.get("coarse_scale", 1.0),
+        base_xy_slope=mc.get("base_xy_slope", 0.12),
+        base_branch_y_slope=mc.get("base_branch_y_slope", 0.06),
+        context_pool_size=mc.get("context_pool_size", 1),
+        log_shapes=mc.get("log_shapes", False),
     )
 
     print(f"Параметров модели: {sum(p.numel() for p in model.parameters()):,}")

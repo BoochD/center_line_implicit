@@ -473,7 +473,7 @@ class GlobalContextSampler(nn.Module):
     to Z-progression. It aggregates context from the full 3D bottleneck.
     """
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, pool_size: int = 1, log_shapes: bool = False):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
@@ -482,18 +482,32 @@ class GlobalContextSampler(nn.Module):
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.GELU(),
         )
-        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.pool_size = int(pool_size)
+        self.pool = nn.AdaptiveAvgPool3d(self.pool_size)
+        self.log_shapes = bool(log_shapes)
+        self._shape_logged = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (B, C, X, Y, Z)
         Returns:
-            global_ctx: (B, C')
+            global_ctx: (B, C' * pool_size^3)
         """
+        do_log = self.log_shapes and not self._shape_logged
+        if do_log:
+            print(f"[GlobalContextSampler] input (bottleneck) shape: {tuple(x.shape)}")
         x = self.proj(x)
+        if do_log:
+            print(f"[GlobalContextSampler] after self.proj shape:    {tuple(x.shape)}")
         x = self.pool(x)
-        return x.flatten(1)
+        if do_log:
+            print(f"[GlobalContextSampler] after self.pool shape:    {tuple(x.shape)}  (pool_size={self.pool_size})")
+        out = x.flatten(1)
+        if do_log:
+            print(f"[GlobalContextSampler] flattened output shape:   {tuple(out.shape)}")
+            self._shape_logged = True
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -717,8 +731,17 @@ class ImplicitCurveNet(nn.Module):
         branch_emb_dim: int = 8,
         local_feat_channels: int = 32,
         num_refine_passes: int = 1,
+        refine_scale: float = 0.25,
+        coarse_scale: float = 1.0,
+        base_xy_slope: float = 0.12,
+        base_branch_y_slope: float = 0.06,
+        context_pool_size: int = 1,
+        log_shapes: bool = False,
     ):
         super().__init__()
+
+        self.log_shapes = bool(log_shapes)
+        self._encdec_shape_logged = False
 
         unet = Unet(
             in_channels=in_channels,
@@ -739,14 +762,30 @@ class ImplicitCurveNet(nn.Module):
             nn.Conv3d(16, 1, kernel_size=1),
         )
 
-        bottleneck_channels = self.encoder.out_channels[0]
+        # nnspt.Unet.encoder returns features ordered fine→coarse
+        # (features[0] = identity/raw input, features[-1] = deepest bottleneck).
+        # We want the deepest semantic features.
+        bottleneck_channels = self.encoder.out_channels[-1]
+        self.context_pool_size = int(context_pool_size)
         self.context_sampler = GlobalContextSampler(
             in_channels=bottleneck_channels,
             out_channels=context_channels,
+            pool_size=self.context_pool_size,
+            log_shapes=self.log_shapes,
         )
+        # GlobalContextSampler flattens pooled volume to (B, context_channels * pool_size^3)
+        ctx_dim = context_channels * (self.context_pool_size ** 3)
 
         self.local_feat_channels = max(0, int(local_feat_channels))
         self.num_refine_passes = max(0, int(num_refine_passes))
+        self.refine_scale = float(refine_scale)
+        self.coarse_scale = float(coarse_scale)
+        self.base_xy_slope = float(base_xy_slope)
+        self.base_branch_y_slope = float(base_branch_y_slope)
+        self.last_delta_mean = 0.0
+        self.last_delta_max = 0.0
+        self.last_coarse_delta_mean = 0.0
+        self.last_coarse_delta_max = 0.0
         if self.local_feat_channels > 0:
             self.local_sampler = LocalFeatureSampler(
                 in_channels=decoder_out_channels,
@@ -758,9 +797,18 @@ class ImplicitCurveNet(nn.Module):
         self.pe = FourierPositionalEncoding(num_freqs=pe_num_freqs)
         pe_dim = self.pe.out_dim
 
-        self.curve_mlp = ImplicitCurveMLP(
+        self.coarse_mlp = ImplicitCurveMLP(
             pe_dim=pe_dim,
-            context_dim=context_channels,
+            context_dim=ctx_dim,
+            branch_emb_dim=branch_emb_dim,
+            hidden_dim=mlp_hidden_dim,
+            num_layers=mlp_num_layers,
+            num_branches=2,
+            local_feat_dim=0,
+        )
+        self.refine_mlp = ImplicitCurveMLP(
+            pe_dim=pe_dim,
+            context_dim=ctx_dim,
             branch_emb_dim=branch_emb_dim,
             hidden_dim=mlp_hidden_dim,
             num_layers=mlp_num_layers,
@@ -768,11 +816,53 @@ class ImplicitCurveNet(nn.Module):
             local_feat_dim=self.local_feat_channels,
         )
 
+        # Important initialisation: both curve heads predict residuals.
+        # Zero output heads make the initial curve equal to the simple tilted
+        # base line instead of a random Fourier curve/ring.
+        nn.init.zeros_(self.coarse_mlp.out.weight)
+        nn.init.zeros_(self.coarse_mlp.out.bias)
+        nn.init.zeros_(self.refine_mlp.out.weight)
+        nn.init.zeros_(self.refine_mlp.out.bias)
+
+    def _base_curve(self, t: torch.Tensor, branch_id: int) -> torch.Tensor:
+        """
+        Branch-aware tilted base curve.
+
+        Both branches meet at the opposite end, t=1: (0, 0, 1).
+        Moving towards t=0, they smoothly diverge in the axial plane:
+            left  branch_id=0 → positive x/y direction,
+            right branch_id=1 → negative x/y direction.
+
+        This gives the zero-initialised residual heads a more anatomical prior:
+        not two identical curves on top of each other, but a shared bifurcation
+        root with left/right branches gradually separating away from t=1.
+        """
+        z = 2.0 * t - 1.0
+        branch_sign = 1.0 if branch_id == 0 else -1.0
+        branch_sign = t.new_tensor(branch_sign)
+        divergence = 1.0 - t
+        x = branch_sign * self.base_xy_slope * divergence
+        y = branch_sign * self.base_branch_y_slope * divergence
+        return torch.stack([x, y, z], dim=-1)
+
     def _encode_decode(self, x: torch.Tensor):
-        """Run encoder + decoder, return (decoder_out, bottleneck_features)."""
+        """Run encoder + decoder, return (decoder_out, bottleneck_features).
+
+        nnspt.Unet.encoder produces features ordered from fine to coarse:
+            features[0]  — identity-skip of the raw input (1 channel)
+            features[-1] — deepest semantic bottleneck (many channels)
+        We need the deepest one for global context.
+        """
         features = self.encoder(x)
-        bottleneck = features[0]
+        bottleneck = features[-1]
         decoder_out = self.decoder(*features)
+        if self.log_shapes and not self._encdec_shape_logged:
+            print(f"[ImplicitCurveNet] encoder input shape:          {tuple(x.shape)}")
+            for i, f in enumerate(features):
+                print(f"[ImplicitCurveNet] encoder features[{i}] shape:    {tuple(f.shape)}")
+            print(f"[ImplicitCurveNet] bottleneck (features[-1]):    {tuple(bottleneck.shape)}")
+            print(f"[ImplicitCurveNet] decoder_out shape:            {tuple(decoder_out.shape)}")
+            self._encdec_shape_logged = True
         return decoder_out, bottleneck
 
     def _query_curve(
@@ -783,18 +873,19 @@ class ImplicitCurveNet(nn.Module):
         branch_id: int,
     ) -> torch.Tensor:
         """
-        Two-pass query with point-conditioned local feature refinement.
+        Query with residual point-conditioned local feature refinement.
 
-        Pass 1 (coarse):
-            γ₀(t) = MLP(PE(t), global_ctx, branch_emb, zero_local_feats)
-        Pass k (refine, k=1..num_refine_passes):
-            f_local(t) = LocalFeatureSampler(decoder_out, γ_{k-1}(t))
-            γ_k(t)    = MLP(PE(t), global_ctx, branch_emb, f_local(t))
+        Coarse pass:
+            γ_base(t, branch_id) = branch-aware tilted line, mostly along z
+            γ₀(t) = γ_base(t, branch_id) + coarse_scale * coarse_mlp(PE(t), global_ctx, branch_emb)
+        Refinement pass:
+            f_local(t) = LocalFeatureSampler(decoder_out, γ₀(t))
+            Δγ(t)      = refine_mlp(PE(t), global_ctx, branch_emb, f_local(t))
+            γ(t)       = γ₀(t) + refine_scale * Δγ(t)
 
-        The detach() on γ_{k-1} when sampling features prevents the gradient
-        from flowing through coordinate-dependent indexing back into the coarse
-        pass — only the refined output supervises the previous step indirectly
-        through the shared MLP weights and encoder.
+        The local-feature coordinates are intentionally not detached: gradients
+        can flow through the trilinear sampler into γ₀, so the coarse curve can
+        learn where to query image features.
 
         Args:
             bottleneck:  (B, C_bn, X', Y', Z')
@@ -811,24 +902,31 @@ class ImplicitCurveNet(nn.Module):
         pe = self.pe(t)                                            # (B, N, pe_dim)
         branch_ids = torch.full((B,), branch_id, dtype=torch.long, device=t.device)
 
-        # Pass 1: coarse curve from global context only (no local features yet)
-        local_feats = None
-        if self.local_feat_channels > 0 and self.num_refine_passes > 0:
-            # First pass uses zero local features (handled inside MLP)
-            local_feats = None
+        base = self._base_curve(t, branch_id)                           # (B, N, 3)
+        coarse_delta = self.coarse_mlp(pe, ctx, branch_ids)             # (B, N, 3)
+        coarse = base + self.coarse_scale * coarse_delta
+        points = coarse
+        delta = None
 
-        points = self.curve_mlp(pe, ctx, branch_ids, local_feats)  # (B, N, 3)
-
-        # Refinement passes
         if self.local_sampler is not None and self.num_refine_passes > 0:
+            query_coords = coarse
             for _ in range(self.num_refine_passes):
-                # Sample local features at the previous-iteration coordinates.
-                # Detach the query coords so that the local-feature lookup acts as
-                # a "where to look" pointer; gradients still flow through the
-                # sampled feature values and through the predicted coords.
-                query_coords = points.detach()
-                f_local = self.local_sampler(decoder_out, query_coords)  # (B, N, C_local)
-                points = self.curve_mlp(pe, ctx, branch_ids, f_local)    # (B, N, 3)
+                f_local = self.local_sampler(decoder_out, query_coords)      # (B, N, C_local)
+                delta = self.refine_mlp(pe, ctx, branch_ids, f_local)        # (B, N, 3)
+                points = coarse + self.refine_scale * delta                  # residual refinement
+                query_coords = points                                        # optional iterative refinement, no detach
+
+        with torch.no_grad():
+            coarse_delta_norm = coarse_delta.norm(dim=-1)
+            self.last_coarse_delta_mean = float(coarse_delta_norm.mean().detach().cpu())
+            self.last_coarse_delta_max = float(coarse_delta_norm.max().detach().cpu())
+            if delta is not None:
+                delta_norm = delta.norm(dim=-1)
+                self.last_delta_mean = float(delta_norm.mean().detach().cpu())
+                self.last_delta_max = float(delta_norm.max().detach().cpu())
+            else:
+                self.last_delta_mean = 0.0
+                self.last_delta_max = 0.0
 
         return points
 

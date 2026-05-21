@@ -138,27 +138,37 @@ def curve_plane_loss(
 
 
 def curve_length_loss(
-    dgamma: torch.Tensor,
-    target_speed: float = 1.0,
+    gamma: torch.Tensor,
+    gt_points: torch.Tensor,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    Stable regularizer for approximately arc-length parameterised curves.
+    Compare total polyline length of the predicted curve with the total
+    polyline length of the GT curve at the same sampled t values.
 
-    Instead of forcing one global absolute speed for all samples, penalize only
-    speed *variation* along the curve. This is much more stable because centerlines
-    have different natural total lengths.
+    Both ``gamma`` and ``gt_points`` are expected to be sampled at the same
+    sorted random t values (this is how sample_gt_at_random_t works in
+    train_implicit.py), so the polyline approximation of the integral
+    ∫_0^1 ||γ'(t)|| dt is consistent between pred and GT.
+
+    Loss is a relative squared deviation, averaged over the batch:
+        loss = mean_b ((L_pred_b - L_gt_b) / (L_gt_b + eps))^2
 
     Args:
-        dgamma:       (B, N, 3) — first derivative of curve w.r.t. t
-        target_speed: unused legacy argument, kept for backward compatibility
+        gamma:     (B, N, 3) — predicted curve points
+        gt_points: (B, N, 3) — GT curve points at the same parameter values
 
     Returns:
         scalar loss
     """
-    speed = torch.norm(dgamma, dim=-1)                     # (B, N)
-    mean_speed = speed.mean(dim=1, keepdim=True).clamp_min(1e-6)
-    speed_norm = speed / mean_speed
-    return ((speed_norm - 1.0) ** 2).mean()
+    pred_seg = gamma[:, 1:] - gamma[:, :-1]                # (B, N-1, 3)
+    gt_seg = gt_points[:, 1:] - gt_points[:, :-1]          # (B, N-1, 3)
+
+    pred_len = torch.norm(pred_seg, dim=-1).sum(dim=1)     # (B,)
+    gt_len = torch.norm(gt_seg, dim=-1).sum(dim=1)         # (B,)
+
+    rel = (pred_len - gt_len) / (gt_len + eps)
+    return (rel ** 2).mean()
 
 
 def curve_smooth_loss(
@@ -304,7 +314,7 @@ class ImplicitCurveLoss(nn.Module):
         w_sdf:    float = 1.0,
         w_plane:  float = 0.0,
         w_inside: float = 0.0,
-        arc_length_target_speed: float = 1.0,
+        **_legacy_kwargs,  # tolerate removed args (e.g. arc_length_target_speed)
     ):
         super().__init__()
         self.w_curve  = w_curve
@@ -313,7 +323,6 @@ class ImplicitCurveLoss(nn.Module):
         self.w_sdf    = w_sdf
         self.w_plane  = w_plane
         self.w_inside = w_inside
-        self.arc_length_target_speed = arc_length_target_speed
 
     def compute_curve_losses(
         self,
@@ -337,19 +346,19 @@ class ImplicitCurveLoss(nn.Module):
         zero = torch.zeros(1, device=t.device)[0]
 
         if self.w_smooth > 0.0:
-            # Нужна вторая производная — дороже
+            # Smooth needs the second derivative via autograd over t.
             gamma, dgamma, d2gamma = _second_derivative(model_fn, t, **kwargs)
             l_smooth = curve_smooth_loss(d2gamma)
-            l_length = curve_length_loss(dgamma, self.arc_length_target_speed)
-        elif self.w_length > 0.0:
-            # Только первая производная
-            gamma, dgamma = _first_derivative(model_fn, t, **kwargs)
-            l_smooth = zero
-            l_length = curve_length_loss(dgamma, self.arc_length_target_speed)
         else:
-            # Ни length ни smooth не нужны — прямой вызов без autograd по t
-            gamma    = model_fn(t, **kwargs)
+            # No second-order autograd needed.
+            gamma = model_fn(t, **kwargs)
             l_smooth = zero
+
+        if self.w_length > 0.0:
+            # Length loss is a polyline-based comparison of total lengths,
+            # it does not require autograd over t.
+            l_length = curve_length_loss(gamma, gt_points)
+        else:
             l_length = zero
 
         l_curve = curve_mse_loss(gamma, gt_points)
