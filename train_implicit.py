@@ -260,6 +260,18 @@ class ImplicitCurveDataset(Dataset):
         pts_l_norm = 2.0 * (pts_l / (shape_arr - 1)) - 1.0
         pts_r_norm = 2.0 * (pts_r / (shape_arr - 1)) - 1.0
 
+        # Canonical centering by bifurcation point.
+        # Предполагаем, что левая и правая ветви сходятся в последней точке.
+        bif_point = 0.5 * (pts_l_norm[-1] + pts_r_norm[-1])
+
+        pts_l_norm = pts_l_norm - bif_point
+        pts_r_norm = pts_r_norm - bif_point
+
+        print(
+            f"  [canonical] {name}: bif_point={bif_point.tolist()} "
+            f"left_range={pts_l_norm.min(axis=0).tolist()}..{pts_l_norm.max(axis=0).tolist()} "
+            f"right_range={pts_r_norm.min(axis=0).tolist()}..{pts_r_norm.max(axis=0).tolist()}"
+        )
         t_l, pts_l_norm = arc_length_parameterise(pts_l_norm)
         t_r, pts_r_norm = arc_length_parameterise(pts_r_norm)
 
@@ -282,17 +294,17 @@ class ImplicitCurveDataset(Dataset):
         return V.Sequential([
             # Интенсивностные (не меняют геометрию → точки не трогают)
             V.GaussNoise(variance=0.05, p=0.3),
-            V.GaussBlur(p=0.2),
-            V.IntensityShift(shift_limit=0.1, p=0.8),
+            V.GaussBlur(p=0.25),
+            V.IntensityShift(shift_limit=0.15, p=0.8),
             # Геометрические (меняют и изображение, и маску, и точки)
-            V.AxialPlaneAffine(
-                angle_limit=45,
-                scale_limit=0.1,
-                shift_limit=0.1,
-                p=0.8,
-                fill_value=-1000,
-            ),
-            V.Flip(p=0.5),
+            # V.AxialPlaneAffine(
+            #     angle_limit=75,
+            #     scale_limit=0.25,
+            #     shift_limit=0.25,
+            #     p=1.0,
+            #     fill_value=-1000,
+            # ),
+            # V.Flip(p=0.5),
         ])
 
     def __getitem__(self, idx):
@@ -695,6 +707,7 @@ def fit(model: ImplicitCurveNet, data: dict):
         w_sdf=config["W_SDF"],
         w_plane=config["W_PLANE"],
         w_inside=config.get("W_INSIDE", 0.0),
+        w_speed=config.get("W_SPEED", 0.0),
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=config["LEARNING_RATE"], eps=1e-4)
@@ -765,7 +778,8 @@ def fit(model: ImplicitCurveNet, data: dict):
             f"curve={train_losses['curve_left']:.4f}/{train_losses['curve_right']:.4f} | "
             f"plane={train_losses['plane_left']:.4f}/{train_losses['plane_right']:.4f} | "
             f"len={train_losses['length_left']:.4f}/{train_losses['length_right']:.4f} | "
-            f"smooth={train_losses['smooth_left']:.4f}/{train_losses['smooth_right']:.4f} | "
+            f"speed={train_losses['speed_left']:.4f}/{train_losses['speed_right']:.4f} | "
+            f"smooth={train_losses['smooth_left']:.8f}/{train_losses['smooth_right']:.8f} | "
             f"inside={train_losses.get('inside_left', 0.0):.4f}/{train_losses.get('inside_right', 0.0):.4f} | "
             f"sdf={train_losses['sdf']:.4f} | "
             f"coarse_delta={train_losses.get('coarse_delta_mean', 0.0):.4f}/{train_losses.get('coarse_delta_max', 0.0):.4f} | "
@@ -924,6 +938,7 @@ def main():
     ls = cfg["losses"]
     config["W_CURVE"] = ls["w_curve"]
     config["W_PLANE"] = ls.get("w_plane", 0.0)
+    config["W_SPEED"] = ls.get("w_speed", 0.0)
     config["W_LENGTH"] = ls["w_length"]
     config["W_SMOOTH"] = ls["w_smooth"]
     config["W_SDF"] = ls["w_sdf"]
@@ -986,6 +1001,8 @@ def main():
         coarse_scale=mc.get("coarse_scale", 1.0),
         base_xy_slope=mc.get("base_xy_slope", 0.12),
         base_branch_y_slope=mc.get("base_branch_y_slope", 0.06),
+        affine_max_shift=mc.get("affine_max_shift", 0.6),
+        affine_max_log_scale=mc.get("affine_max_log_scale", 0.35),
         context_pool_size=mc.get("context_pool_size", 1),
         log_shapes=mc.get("log_shapes", False),
     )

@@ -220,12 +220,6 @@ def save_curve_plots(
 
     fig = plt.figure(figsize=(18, 14))
     prefix = f"{title_prefix} | " if title_prefix else ""
-    fig.suptitle(
-        f"{prefix}Epoch {epoch:03d} | {sample_name}\n"
-        f"Синий=pred_left, Красный=pred_right | "
-        f"Голубой=gt_left, Розовый=gt_right",
-        fontsize=11,
-    )
 
     gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.3)
     views = [
@@ -296,32 +290,32 @@ def save_curve_plots(
         n_dense=n_dense,
     )
 
-    ax_tbl = fig.add_subplot(gs[1, 2])
-    ax_tbl.axis("off")
-    rows = [
-        ["Метрика", "Left", "Right"],
-        ["MSD", f"{metrics['msd_left']:.4f}", f"{metrics['msd_right']:.4f}"],
-        ["HD", f"{metrics['hausdorff_left']:.4f}", f"{metrics['hausdorff_right']:.4f}"],
-        ["EP err", f"{metrics['endpoint_error_left']:.4f}", f"{metrics['endpoint_error_right']:.4f}"],
-        ["Speed var", f"{metrics['speed_variance_left']:.4f}", f"{metrics['speed_variance_right']:.4f}"],
-        ["Curvature", f"{metrics['curvature_left']:.4f}", f"{metrics['curvature_right']:.4f}"],
-        ["MSD XY", f"{metrics['msd_xy_left']:.4f}", f"{metrics['msd_xy_right']:.4f}"],
-        ["MSD XZ", f"{metrics['msd_xz_left']:.4f}", f"{metrics['msd_xz_right']:.4f}"],
-        ["MSD YZ", f"{metrics['msd_yz_left']:.4f}", f"{metrics['msd_yz_right']:.4f}"],
-        ["MSD mean", f"{metrics['msd_mean']:.4f}", ""],
-        ["HD mean", f"{metrics['hausdorff_mean']:.4f}", ""],
-    ]
+    # ax_tbl = fig.add_subplot(gs[1, 2])
+    # ax_tbl.axis("off")
+    # rows = [
+    #     ["Метрика", "Left", "Right"],
+    #     ["MSD", f"{metrics['msd_left']:.4f}", f"{metrics['msd_right']:.4f}"],
+    #     ["HD", f"{metrics['hausdorff_left']:.4f}", f"{metrics['hausdorff_right']:.4f}"],
+    #     ["EP err", f"{metrics['endpoint_error_left']:.4f}", f"{metrics['endpoint_error_right']:.4f}"],
+    #     ["Speed var", f"{metrics['speed_variance_left']:.4f}", f"{metrics['speed_variance_right']:.4f}"],
+    #     ["Curvature", f"{metrics['curvature_left']:.4f}", f"{metrics['curvature_right']:.4f}"],
+    #     ["MSD XY", f"{metrics['msd_xy_left']:.4f}", f"{metrics['msd_xy_right']:.4f}"],
+    #     ["MSD XZ", f"{metrics['msd_xz_left']:.4f}", f"{metrics['msd_xz_right']:.4f}"],
+    #     ["MSD YZ", f"{metrics['msd_yz_left']:.4f}", f"{metrics['msd_yz_right']:.4f}"],
+    #     ["MSD mean", f"{metrics['msd_mean']:.4f}", ""],
+    #     ["HD mean", f"{metrics['hausdorff_mean']:.4f}", ""],
+    # ]
 
-    tbl = ax_tbl.table(
-        cellText=rows[1:],
-        colLabels=rows[0],
-        loc="center",
-        cellLoc="center",
-    )
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
-    tbl.scale(1.2, 1.5)
-    ax_tbl.set_title("Метрики", fontsize=9)
+    # tbl = ax_tbl.table(
+    #     cellText=rows[1:],
+    #     colLabels=rows[0],
+    #     loc="center",
+    #     cellLoc="center",
+    # )
+    # tbl.auto_set_font_size(False)
+    # tbl.set_fontsize(8)
+    # tbl.scale(1.2, 1.5)
+    # ax_tbl.set_title("Метрики", fontsize=9)
 
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close(fig)

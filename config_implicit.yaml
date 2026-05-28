@@ -10,31 +10,33 @@ split_options_path: "afolds/foldx.yaml"
 model:
   in_channels: 1
   depth: 5
-  pe_num_freqs: 4
+  pe_num_freqs: 2
   branch_emb_dim: 16
   context_channels: 64
   mlp_hidden_dim: 256       # ширина скрытых слоёв MLP
   mlp_num_layers: 6         # глубина MLP
   local_feat_channels: 40   # сколько каналов локальных фичей семплировать в координатах γ(t); 0 — отключить point-conditioning
   num_refine_passes: 1      # сколько уточняющих проходов с локальными фичами поверх coarse-предсказания
-  refine_scale: 0.5        # масштаб local residual-поправки: gamma = coarse + refine_scale * delta
+  refine_scale: 0.8        # масштаб local residual-поправки: gamma = coarse + refine_scale * delta
   coarse_scale: 1.0         # масштаб coarse residual-поправки поверх базовой наклонной линии
   base_xy_slope: 0.18       # x-разведение базовых веток от общей точки t=1 к t=0: left в +x, right в -x
   base_branch_y_slope: 0.08 # y-разведение базовых веток от общей точки t=1 к t=0; вместе с x даёт разные XY-направления
-  context_pool_size: 3      # размер AdaptiveAvgPool3d в GlobalContextSampler. У bottleneck'а EffNetV2-B0 пространство ~3x3x3, поэтому 3 даёт identity-pool (без потери info), 1 даёт чисто глобальный вектор
+  affine_max_shift: 0.6     # максимум patient-specific сдвига affine-head по каждой оси в нормированных координатах
+  affine_max_log_scale: 0.35 # максимум |log(scale)|; scale ограничен примерно диапазоном [0.70, 1.42]
+  context_pool_size: 6      # размер AdaptiveAvgPool3d в GlobalContextSampler. У bottleneck'а EffNetV2-B0 пространство ~3x3x3, поэтому 3 даёт identity-pool (без потери info), 1 даёт чисто глобальный вектор
   log_shapes: true          # при первом forward-проходе вывести shape'ы encoder/decoder/context_sampler
 
 # ---- Обучение ----
 training:
   epochs: 2000
   stop_epochs: 2000           # early stopping
-  batch_size: 4
+  batch_size: 2
   accumulation_steps: 1
   learning_rate: 1.5e-4
-  lr_sched_factor: 0.5      # во сколько раз уменьшать LR при плато
-  lr_sched_patience: 400     # сколько эпох ждать без улучшения val MSD
+  lr_sched_factor: 0.6      # во сколько раз уменьшать LR при плато
+  lr_sched_patience: 40     # сколько эпох ждать без улучшения val MSD
   lr_sched_min_lr: 1.0e-5   # нижняя граница LR
-  npoints_query: 512        # число случайных t на шаг на ветвь
+  npoints_query: 1024        # число случайных t на шаг на ветвь
   target_branch: "both"     # both / left / right: какую ветку обучать curve-loss'ами
   modelname: "model_implicit.pth"
 
@@ -49,10 +51,10 @@ losses:
   w_curve: 1.0
   w_plane: 0.2            
   w_length: 0.05
-  w_smooth: 0.0
+  w_smooth: 0.05
   w_sdf: 0.05
   w_inside: 0.002
-
+  w_speed: 0.05
 # ---- ClearML ----
 clearml:
   enabled: false

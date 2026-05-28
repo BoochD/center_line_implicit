@@ -170,6 +170,26 @@ def curve_length_loss(
     rel = (pred_len - gt_len) / (gt_len + eps)
     return (rel ** 2).mean()
 
+def curve_speed_loss(
+    dgamma: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Stable regularizer for approximately arc-length parameterised curves.
+
+    Instead of forcing one global absolute speed for all samples, penalize only
+    speed *variation* along the curve. This is much more stable because centerlines
+    have different natural total lengths.
+
+    Args:
+        dgamma:       (B, N, 3) — first derivative of curve w.r.t. t
+
+    Returns:
+        scalar loss
+    """
+    speed = torch.norm(dgamma, dim=-1)                     # (B, N)
+    mean_speed = speed.mean(dim=1, keepdim=True).clamp_min(1e-6)
+    speed_norm = speed / mean_speed
+    return ((speed_norm - 1.0) ** 2).mean()
 
 def curve_smooth_loss(
     d2gamma: torch.Tensor,
@@ -314,9 +334,11 @@ class ImplicitCurveLoss(nn.Module):
         w_sdf:    float = 1.0,
         w_plane:  float = 0.0,
         w_inside: float = 0.0,
+        w_speed: float = 0.0,
         **_legacy_kwargs,  # tolerate removed args (e.g. arc_length_target_speed)
     ):
         super().__init__()
+        self.w_speed = w_speed
         self.w_curve  = w_curve
         self.w_length = w_length
         self.w_smooth = w_smooth
@@ -346,12 +368,14 @@ class ImplicitCurveLoss(nn.Module):
         zero = torch.zeros(1, device=t.device)[0]
 
         if self.w_smooth > 0.0:
-            # Smooth needs the second derivative via autograd over t.
             gamma, dgamma, d2gamma = _second_derivative(model_fn, t, **kwargs)
             l_smooth = curve_smooth_loss(d2gamma)
+        elif self.w_speed > 0.0:
+            gamma, dgamma = _first_derivative(model_fn, t, **kwargs)
+            l_smooth = zero
         else:
-            # No second-order autograd needed.
             gamma = model_fn(t, **kwargs)
+            dgamma = None
             l_smooth = zero
 
         if self.w_length > 0.0:
@@ -360,6 +384,11 @@ class ImplicitCurveLoss(nn.Module):
             l_length = curve_length_loss(gamma, gt_points)
         else:
             l_length = zero
+
+        if self.w_speed > 0.0 and dgamma is not None:
+            l_speed = curve_speed_loss(dgamma)
+        else:
+            l_speed = zero
 
         l_curve = curve_mse_loss(gamma, gt_points)
         l_plane = curve_plane_loss(gamma, gt_points)
@@ -370,6 +399,7 @@ class ImplicitCurveLoss(nn.Module):
             "length": l_length,
             "smooth": l_smooth,
             "gamma":  gamma,
+            "speed": l_speed,
         }
 
     def forward(
@@ -437,6 +467,7 @@ class ImplicitCurveLoss(nn.Module):
                 + self.w_length * left_losses["length"]
                 + self.w_smooth * left_losses["smooth"]
                 + self.w_inside * l_inside_left
+                + self.w_speed  * left_losses["speed"]
             )
 
         if right_losses is not None:
@@ -446,6 +477,7 @@ class ImplicitCurveLoss(nn.Module):
                 + self.w_length * right_losses["length"]
                 + self.w_smooth * right_losses["smooth"]
                 + self.w_inside * l_inside_right
+                + self.w_speed  * right_losses["speed"]
             )
 
         return {
@@ -458,6 +490,8 @@ class ImplicitCurveLoss(nn.Module):
             "length_right": right_losses["length"] if right_losses is not None else zero,
             "smooth_left":  left_losses["smooth"] if left_losses is not None else zero,
             "smooth_right": right_losses["smooth"] if right_losses is not None else zero,
+            "speed_left":  left_losses["speed"] if left_losses is not None else zero,
+            "speed_right": right_losses["speed"] if right_losses is not None else zero,
             "inside_left":  l_inside_left,
             "inside_right": l_inside_right,
             "sdf":          l_sdf,
